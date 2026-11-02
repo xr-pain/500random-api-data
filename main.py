@@ -1,152 +1,99 @@
-import asyncio
-import json
-import os
-import random
-from contextlib import asynccontextmanager
+import os, random, time, threading, requests
 from datetime import datetime, timezone
+from flask import Flask, jsonify
 
-from fastapi import FastAPI
-from supabase import create_client, Client
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jnhpnsfdnckkpnyrmpkc.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_t52nYcH5sW43P48ZSUE4eg_GWwyg_ma")
+TOTAL, KEEP, INTERVAL = 500, 10, 30
 
-# ---- config ----
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jnhpnsfdnckkpnyrmpkc.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_t52nYcH5sW43P48ZSUE4eg_GWwyg_ma")
+H = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+     "Content-Type": "application/json"}
+URL = f"{SUPABASE_URL}/rest/v1/signals"
 
-MAX_SIGNALS            = 500
-INTERVAL_SECONDS       = 30
-PREDICTIONS_PER_SIGNAL = 10
-
-supabase: Client | None = None
-generator_task: asyncio.Task | None = None
-
-
-def get_client() -> Client:
-    global supabase
-    if supabase is None:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return supabase
+app = Flask(__name__)
+lock = threading.Lock()
+store = {i: {"name": f"SIGNAL{i:03d}", "data": []} for i in range(1, TOTAL + 1)}
 
 
-def get_count() -> int:
-    res = get_client().table("signals").select("id", count="exact").execute()
-    return res.count if res.count is not None else len(res.data or [])
-
-
-def get_last_created_at() -> datetime | None:
-    res = (
-        get_client()
-        .table("signals")
-        .select("created_at")
-        .order("id", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not res.data:
-        return None
-    raw = res.data[0]["created_at"]
-    return datetime.fromisoformat(raw.replace("Z", "+00:00")) if isinstance(raw, str) else raw
-
-
-def generate_one() -> bool:
-    count = get_count()
-    if count >= MAX_SIGNALS:
-        return False
-
-    idx  = count + 1
-    name = f"SIGNAL {str(idx).zfill(3)}"
-    predictions = [random.choice(["BIG", "SMALL"]) for _ in range(PREDICTIONS_PER_SIGNAL)]
-
+def load_db():
     try:
-        get_client().table("signals").insert(
-            {"name": name, "predictions": predictions}
-        ).execute()
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Inserted {name}: {predictions}")
-        return True
+        r = requests.get(URL + "?select=id,name,data&order=id&limit=1000", headers=H, timeout=20)
+        for row in r.json():
+            store[row["id"]] = {"name": row["name"], "data": row["data"] or []}
     except Exception as e:
-        print(f"Insert error: {e}")
-        return False
+        print("load error", e)
 
 
-async def generator_loop():
-    # restart-safe: last signal থেকে 30s হয়নি হলে বাকি সময় wait
-    last = get_last_created_at()
-    if last:
-        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        wait = INTERVAL_SECONDS - elapsed
-        if wait > 0:
-            print(f"Waiting {wait:.1f}s before next signal...")
-            await asyncio.sleep(wait)
+def tick():
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    with lock:
+        for i, s in store.items():
+            s["data"] = ([{"p": random.choice(["BIG", "SMALL"]), "t": now}] + s["data"])[:KEEP]
+            rows.append({"id": i, "name": s["name"], "data": s["data"]})
+    try:
+        h = dict(H, Prefer="resolution=merge-duplicates")
+        requests.post(URL + "?on_conflict=id", headers=h, json=rows, timeout=30)
+    except Exception as e:
+        print("save error", e)
 
+
+def loop():
+    load_db()
+    nxt = time.time()
     while True:
-        if get_count() >= MAX_SIGNALS:
-            print("✅ Reached 500 signals. Generator stopped.")
-            return
-        generate_one()
-        await asyncio.sleep(INTERVAL_SECONDS)
+        tick()
+        nxt += INTERVAL
+        time.sleep(max(0, nxt - time.time()))
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global generator_task
-    generator_task = asyncio.create_task(generator_loop())
-    yield
-    if generator_task:
-        generator_task.cancel()
-        try:
-            await generator_task
-        except asyncio.CancelledError:
-            pass
+threading.Thread(target=loop, daemon=True).start()
 
 
-app = FastAPI(lifespan=lifespan)
-
-
-@app.get("/")
-def root():
+def fmt(i):
+    s = store[i]
     return {
-        "api": "Big/Small Signal API",
-        "endpoints": ["/api/latest", "/api/ping"],
-        "max_signals": MAX_SIGNALS,
-        "interval_seconds": INTERVAL_SECONDS,
+        "signal": s["name"],
+        "id": i,
+        "signals": [
+            {"no": n + 1, "prediction": d["p"], "ago_seconds": (n + 1) * INTERVAL}
+            for n, d in enumerate(s["data"])
+        ],
     }
 
 
-@app.get("/api/ping")
-def ping():
-    return {"pong": True, "now": datetime.now(timezone.utc).isoformat()}
+@app.after_request
+def cors(r):
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
 
 
-@app.get("/api/latest")
-def latest():
-    total = get_count()
-    rows = (
-        get_client()
-        .table("signals")
-        .select("*")
-        .order("id", desc=True)
-        .limit(10)
-        .execute()
-    ).data or []
+@app.route("/")
+def home():
+    return jsonify({"total": TOTAL, "all": "/api/all", "single": "/api/signal/1",
+                    "list": "/api/list"})
 
-    latest_list = []
-    for i, row in enumerate(rows, start=1):
-        preds = row["predictions"]
-        if isinstance(preds, str):
-            try:
-                preds = json.loads(preds)
-            except Exception:
-                preds = []
-        latest_list.append({
-            "index": i,
-            "name": row["name"],
-            "predictions": [{"no": j + 1, "result": p} for j, p in enumerate(preds)],
-            "created_at": row["created_at"],
-        })
 
-    return {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "total_signals": total,
-        "max_signals": MAX_SIGNALS,
-        "interval_seconds": INTERVAL_SECONDS,
-        "latest_10": latest_list,
-    }
+@app.route("/health")
+def health():
+    return "ok"
+
+
+@app.route("/api/list")
+def lst():
+    return jsonify([{"id": i, "name": s["name"], "url": f"/api/signal/{i}"}
+                    for i, s in store.items()])
+
+
+@app.route("/api/signal/<key>")
+def one(key):
+    k = key.upper().replace("SIGNAL", "")
+    if not k.isdigit() or not (1 <= int(k) <= TOTAL):
+        return jsonify({"error": "1-500 er moddhe dao"}), 404
+    return jsonify(fmt(int(k)))
+
+
+@app.route("/api/all")
+def all_():
+    with lock:
+        return jsonify([fmt(i) for i in store])
